@@ -168,42 +168,45 @@ impl Database for MySqlDatabase {
 
 pub struct PostgresDatabase {
     config: Arc<Config>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    client: tokio_postgres::Client,
 }
 
 impl PostgresDatabase {
     pub fn new(config: Arc<Config>) -> Self {
-        let runtime =
-            Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
-        Self { config, runtime }
-    }
-
-    fn get_client(&self) -> Result<tokio_postgres::Client, Box<dyn Error + Send + Sync>> {
-        let host = self.config.dbip.as_deref().unwrap_or("localhost");
-        let port = self.config.dbport.unwrap_or(5432);
+        let host = config.dbip.as_deref().unwrap_or("localhost");
+        let port = config.dbport.unwrap_or(5432);
 
         let conn_str = format!(
             "host={} port={} user={} password={} dbname={}",
-            host, port, self.config.dbuser, self.config.dbpassword, self.config.dbname
+            host, port, config.dbuser, config.dbpassword, config.dbname
         );
 
-        let runtime = Arc::clone(&self.runtime);
+        // Create a separate runtime for initialization only
+        let init_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create initialization runtime");
 
-        runtime.block_on(async {
-            let (client, connection) =
-                tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await?;
+        // Use the separate runtime to establish the connection
+        let (client, connection) = init_runtime.block_on(async {
+            tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+                .await
+                .expect("Failed to connect to PostgreSQL")
+        });
 
-            // Important: This task must persist for the lifetime of the client.
-            // We don't need to keep the handle because the task will run
-            // as long as the runtime exists.
-            runtime.spawn(async move {
-                if let Err(e) = connection.await {
-                    eprintln!("PostgreSQL connection error: {}", e);
-                }
-            });
+        // Spawn the connection management on a background thread
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create connection runtime");
 
-            Ok(client)
-        })
+            if let Err(e) = rt.block_on(connection) {
+                eprintln!("PostgreSQL connection error: {}", e);
+            }
+        });
+
+        Self { config, client }
     }
 }
 
@@ -213,11 +216,13 @@ impl Database for PostgresDatabase {
         certnum: &str,
         revoked: bool,
     ) -> Result<OcspCertStatus, Box<dyn Error + Send + Sync>> {
-        let client = self.get_client()?;
-        let runtime = Arc::clone(&self.runtime);
+        // Use a separate runtime for this operation
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
 
-        let rows = runtime.block_on(async {
-            client.query(
+        let rows = rt.block_on(async {
+            self.client.query(
                 "SELECT status, revocation_time, revocation_reason FROM ocsp_list_certs WHERE cert_num = $1",
                 &[&certnum],
             ).await
@@ -287,11 +292,13 @@ impl Database for PostgresDatabase {
             return Ok(());
         }
 
-        let client = self.get_client()?;
-        let runtime = Arc::clone(&self.runtime);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
 
-        let exists = runtime.block_on(async {
-            let rows = client
+        let exists = rt.block_on(async {
+            let rows = self
+                .client
                 .query(
                     "SELECT EXISTS (
                     SELECT FROM information_schema.tables
@@ -310,8 +317,9 @@ impl Database for PostgresDatabase {
             return Ok(());
         }
 
-        let types_exist = runtime.block_on(async {
-            let rows = client
+        let types_exist = rt.block_on(async {
+            let rows = self
+                .client
                 .query(
                     "SELECT EXISTS (
                     SELECT FROM pg_type
@@ -326,8 +334,8 @@ impl Database for PostgresDatabase {
         })?;
 
         if !types_exist {
-            runtime.block_on(async {
-                client
+            rt.block_on(async {
+                self.client
                     .batch_execute(
                         "CREATE TYPE cert_status AS ENUM ('Valid', 'Revoked');
                          CREATE TYPE revocation_reason_enum AS ENUM (
@@ -346,8 +354,8 @@ impl Database for PostgresDatabase {
             })?;
         }
 
-        runtime.block_on(async {
-            client
+        rt.block_on(async {
+            self.client
                 .batch_execute(
                     "CREATE TABLE ocsp_list_certs (
                     cert_num VARCHAR(50) PRIMARY KEY,
