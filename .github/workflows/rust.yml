@@ -2,10 +2,10 @@ name: Rust
 
 on:
   push:
-    branches: [ "compat" ]
+    branches: [ "*" ]
     tags: [ "v*" ]
   pull_request:
-    branches: [ "compat" ]
+    branches: [ "*" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config
+          sudo apt-get install -y pkg-config libssl-dev libpq-dev libmysqlclient-dev
       - name: Install Rust
         run: |
           rustup update stable
@@ -43,6 +43,30 @@ jobs:
     name: Test
     needs: check
     runs-on: ubuntu-latest
+    services:
+      # MySQL service container for tests
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: certs
+          MYSQL_USER: ocsp
+          MYSQL_PASSWORD: ocsp
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+      # PostgreSQL service container for tests
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: ocsp
+          POSTGRES_PASSWORD: ocsp
+          POSTGRES_DB: certs
+        ports:
+          - 5432:5432
+        options: --health-cmd="pg_isready" --health-interval=10s --health-timeout=5s --health-retries=3
+
     strategy:
       matrix:
         rust: [stable, beta]
@@ -60,11 +84,28 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config
+          sudo apt-get install -y pkg-config libssl-dev libpq-dev libmysqlclient-dev
       - name: Install Rust
         run: |
           rustup update ${{ matrix.rust }}
           rustup default ${{ matrix.rust }}
+      - name: Create test config
+        run: |
+          echo 'cachedays = 3
+          db_type = "mysql"
+          dbip = "127.0.0.1"
+          port = 9000
+          timeout = 10
+          dbuser = "ocsp"
+          dbpassword = "ocsp"
+          dbname = "certs"
+          cachefolder = "./cache/"
+          itcert = "test_files/cert.pem"
+          itkey = "test_files/key.pem"
+          revocextended = false
+          caching = false
+          create_table = true' > config.toml
+          mkdir -p cache
       - name: Build
         run: cargo build --verbose
       - name: Run tests
@@ -88,7 +129,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libudev-dev
+          sudo apt-get install -y pkg-config libssl-dev libpq-dev libmysqlclient-dev
       - name: Install Rust
         run: |
           rustup update stable

@@ -9,6 +9,9 @@ pkgs.mkShell {
     rust-analyzer
     git
     openssl
+    libmysqlclient
+    postgresql
+    pkg-config
   ];
 
   shellHook = ''

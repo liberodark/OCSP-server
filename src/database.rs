@@ -1,11 +1,22 @@
-use crate::r#struct::{Certinfo, Config};
+use crate::r#struct::{
+    BoolResult, CertRecord, Config, DEFAULT_MYSQL_PORT, DEFAULT_MYSQL_TABLE, DEFAULT_POSTGRES_PORT,
+    DEFAULT_POSTGRES_TABLE,
+};
+use async_trait::async_trait;
 use chrono::{Datelike, Timelike};
-use mysql::prelude::*;
+use diesel::prelude::*;
+use diesel::r2d2::{ConnectionManager, Pool};
+use diesel::sql_types;
+use diesel::{MysqlConnection, PgConnection};
+use log::{debug, info, warn};
 use ocsp::common::asn1::GeneralizedTime;
 use ocsp::response::{CertStatus as OcspCertStatus, CertStatusCode, CrlReason, RevokedInfo};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
+
+type MysqlPool = Pool<ConnectionManager<MysqlConnection>>;
+type PgPool = Pool<ConnectionManager<PgConnection>>;
 
 pub enum DatabaseType {
     MySQL,
@@ -19,120 +30,159 @@ impl DatabaseType {
             _ => DatabaseType::MySQL,
         }
     }
+
+    #[allow(dead_code)]
+    fn default_table_name(&self) -> &'static str {
+        match self {
+            DatabaseType::MySQL => DEFAULT_MYSQL_TABLE,
+            DatabaseType::PostgreSQL => DEFAULT_POSTGRES_TABLE,
+        }
+    }
 }
 
+#[async_trait]
 pub trait Database: Send + Sync {
-    fn check_cert(
+    async fn check_cert(
         &self,
         certnum: &str,
         revoked: bool,
     ) -> Result<OcspCertStatus, Box<dyn Error + Send + Sync>>;
+
     fn create_tables_if_needed(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
 }
 
-pub struct MySqlDatabase {
+pub struct DieselMysqlDatabase {
     config: Arc<Config>,
+    pool: MysqlPool,
+    table_name: String,
 }
 
-impl MySqlDatabase {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+impl DieselMysqlDatabase {
+    pub fn new(config: Arc<Config>) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let database_url = match &config.dbip {
+            Some(host) => format!(
+                "mysql://{}:{}@{}:{}/{}",
+                config.dbuser,
+                config.dbpassword,
+                host,
+                config.dbport.unwrap_or(DEFAULT_MYSQL_PORT),
+                config.dbname
+            ),
+            None => format!(
+                "mysql://{}:{}@localhost/{}",
+                config.dbuser, config.dbpassword, config.dbname
+            ),
+        };
+
+        let manager = ConnectionManager::<MysqlConnection>::new(database_url);
+        let pool = Pool::builder()
+            .max_size(15)
+            .connection_timeout(Duration::from_secs(config.time as u64))
+            .build(manager)?;
+
+        let table_name = config
+            .table_name
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MYSQL_TABLE.to_string());
+
+        Ok(Self {
+            config,
+            pool,
+            table_name,
+        })
     }
 
-    fn get_connection(&self) -> Result<mysql::Conn, mysql::Error> {
-        let mut opts = mysql::OptsBuilder::new()
-            .user(Some(&self.config.dbuser))
-            .read_timeout(Some(Duration::new(self.config.time as u64, 0)))
-            .db_name(Some(&self.config.dbname))
-            .pass(Some(&self.config.dbpassword));
-
-        if let Some(ip) = &self.config.dbip {
-            opts = opts.ip_or_hostname(Some(ip));
-        } else {
-            opts = opts
-                .prefer_socket(true)
-                .socket(Some("/run/mysqld/mysqld.sock"));
-        }
-
-        if let Some(port) = self.config.dbport {
-            opts = opts.tcp_port(port);
-        }
-
-        mysql::Conn::new(opts)
+    fn get_connection(
+        &self,
+    ) -> Result<
+        diesel::r2d2::PooledConnection<ConnectionManager<MysqlConnection>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        Ok(self.pool.get()?)
     }
 }
 
-impl Database for MySqlDatabase {
-    fn check_cert(
+#[async_trait]
+impl Database for DieselMysqlDatabase {
+    async fn check_cert(
         &self,
         certnum: &str,
         revoked: bool,
     ) -> Result<OcspCertStatus, Box<dyn Error + Send + Sync>> {
-        let mut conn = self.get_connection()?;
+        let table_name = self.table_name.clone();
+        let cert_num = certnum.to_string();
+        let connection_manager = self.pool.clone();
 
-        let status = conn.exec_map(
-            "SELECT status, revocation_time, revocation_reason FROM list_certs WHERE cert_num=?",
-            (String::from(certnum),),
-            |(status, revocation_time, revocation_reason)| Certinfo {
-                status,
-                revocation_time,
-                revocation_reason,
-            },
-        )?;
+        let result = tokio::task::spawn_blocking(move || -> Result<OcspCertStatus, Box<dyn Error + Send + Sync>> {
+            let mut conn = connection_manager.get()?;
 
-        if status.is_empty() {
-            warn!("Entry not found for cert {}", certnum);
-            if !revoked {
-                Ok(OcspCertStatus::new(CertStatusCode::Unknown, None))
+            // Using text SQL query with explicit column names and types
+            let query = format!(
+                "SELECT cert_num, revocation_time, revocation_reason, status FROM {} WHERE cert_num = ?",
+                table_name
+            );
+
+            let results = diesel::sql_query(query)
+                .bind::<sql_types::Text, _>(&cert_num)
+                .load::<CertRecord>(&mut conn)?;
+
+            if results.is_empty() {
+                warn!("Entry not found for cert {}", cert_num);
+                if !revoked {
+                    Ok(OcspCertStatus::new(CertStatusCode::Unknown, None))
+                } else {
+                    Ok(OcspCertStatus::new(
+                        CertStatusCode::Revoked,
+                        Some(RevokedInfo::new(
+                            GeneralizedTime::new(1970, 1, 1, 0, 0, 0).unwrap(),
+                            Some(CrlReason::OcspRevokeCertHold),
+                        )),
+                    ))
+                }
             } else {
-                Ok(OcspCertStatus::new(
-                    CertStatusCode::Revoked,
-                    Some(RevokedInfo::new(
-                        GeneralizedTime::new(1970, 1, 1, 0, 0, 0).unwrap(),
-                        Some(CrlReason::OcspRevokeCertHold),
-                    )),
-                ))
-            }
-        } else {
-            let statut = status[0].clone();
-            debug!("Entry found for cert {}, status {}", certnum, statut.status);
-            if statut.status == "Revoked" {
-                let time = GeneralizedTime::now();
-                let date = &statut.revocation_time;
-                let timenew = match date {
-                    Some(mysql::Value::Date(year, month, day, hour, min, sec, _ms)) => {
+                let record = &results[0];
+                debug!("Entry found for cert {}, status {}", cert_num, record.status);
+
+                if record.status == "Revoked" {
+                    let time = GeneralizedTime::now();
+
+                    let time = if let Some(rt) = record.revocation_time {
                         GeneralizedTime::new(
-                            i32::from(*year),
-                            u32::from(*month),
-                            u32::from(*day),
-                            u32::from(*hour),
-                            u32::from(*min),
-                            u32::from(*sec),
-                        )
-                    }
-                    _ => Ok(time),
-                };
-                let time = timenew.unwrap_or(time);
-                let motif = statut.revocation_reason.unwrap_or_default();
-                let motif: CrlReason = match motif.as_str() {
-                    "key_compromise" => CrlReason::OcspRevokeKeyCompromise,
-                    "ca_compromise" => CrlReason::OcspRevokeCaCompromise,
-                    "affiliation_changed" => CrlReason::OcspRevokeAffChanged,
-                    "superseded" => CrlReason::OcspRevokeSuperseded,
-                    "cessation_of_operation" => CrlReason::OcspRevokeCessOperation,
-                    "certificate_hold" => CrlReason::OcspRevokeCertHold,
-                    "privilege_withdrawn" => CrlReason::OcspRevokePrivWithdrawn,
-                    "aa_compromise" => CrlReason::OcspRevokeAaCompromise,
-                    _ => CrlReason::OcspRevokeUnspecified,
-                };
-                Ok(OcspCertStatus::new(
-                    CertStatusCode::Revoked,
-                    Some(RevokedInfo::new(time, Some(motif))),
-                ))
-            } else {
-                Ok(OcspCertStatus::new(CertStatusCode::Good, None))
+                            rt.year(),
+                            rt.month(),
+                            rt.day(),
+                            rt.hour(),
+                            rt.minute(),
+                            rt.second(),
+                        ).unwrap_or(time)
+                    } else {
+                        time
+                    };
+
+                    let motif = record.revocation_reason.clone().unwrap_or_default();
+                    let motif: CrlReason = match motif.as_str() {
+                        "key_compromise" => CrlReason::OcspRevokeKeyCompromise,
+                        "ca_compromise" => CrlReason::OcspRevokeCaCompromise,
+                        "affiliation_changed" => CrlReason::OcspRevokeAffChanged,
+                        "superseded" => CrlReason::OcspRevokeSuperseded,
+                        "cessation_of_operation" => CrlReason::OcspRevokeCessOperation,
+                        "certificate_hold" => CrlReason::OcspRevokeCertHold,
+                        "privilege_withdrawn" => CrlReason::OcspRevokePrivWithdrawn,
+                        "aa_compromise" => CrlReason::OcspRevokeAaCompromise,
+                        _ => CrlReason::OcspRevokeUnspecified,
+                    };
+
+                    Ok(OcspCertStatus::new(
+                        CertStatusCode::Revoked,
+                        Some(RevokedInfo::new(time, Some(motif))),
+                    ))
+                } else {
+                    Ok(OcspCertStatus::new(CertStatusCode::Good, None))
+                }
             }
-        }
+        }).await??;
+
+        Ok(result)
     }
 
     fn create_tables_if_needed(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -141,145 +191,171 @@ impl Database for MySqlDatabase {
         }
 
         let mut conn = self.get_connection()?;
+        let query = format!("SHOW TABLES LIKE '{}'", self.table_name);
 
-        let tables = conn.query_map("SHOW TABLES LIKE 'list_certs'", |table_name: String| {
-            table_name
-        })?;
+        // For checking if table exists, we'll use execute instead of load for simpler handling
+        let exists: bool = diesel::sql_query(query)
+            .execute(&mut conn)
+            .map(|count| count > 0)?;
 
-        if !tables.is_empty() {
-            info!("Table list_certs already exists in MySQL database");
+        if exists {
+            info!("Table {} already exists in MySQL database", self.table_name);
             return Ok(());
         }
 
-        conn.query_drop(
-            "CREATE TABLE `list_certs` (
+        let create_table_query = format!(
+            "CREATE TABLE `{}` (
                 `cert_num` varchar(50) NOT NULL,
                 `revocation_time` datetime DEFAULT NULL,
                 `revocation_reason` enum('unspecified','key_compromise','ca_compromise','affiliation_changed','superseded','cessation_of_operation','certificate_hold','privilege_withdrawn','aa_compromise') DEFAULT NULL,
                 `status` enum('Valid','Revoked') NOT NULL DEFAULT 'Valid',
                 PRIMARY KEY (`cert_num`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-        )?;
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+            self.table_name
+        );
 
-        info!("Table list_certs created successfully in MySQL database");
+        diesel::sql_query(create_table_query).execute(&mut conn)?;
+
+        info!(
+            "Table {} created successfully in MySQL database",
+            self.table_name
+        );
         Ok(())
     }
 }
 
-pub struct PostgresDatabase {
+pub struct DieselPgDatabase {
     config: Arc<Config>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    pool: PgPool,
+    table_name: String,
 }
 
-impl PostgresDatabase {
-    pub fn new(config: Arc<Config>) -> Self {
-        let runtime =
-            Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
-        Self { config, runtime }
-    }
+impl DieselPgDatabase {
+    pub fn new(config: Arc<Config>) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let database_url = match &config.dbip {
+            Some(host) => format!(
+                "postgres://{}:{}@{}:{}/{}",
+                config.dbuser,
+                config.dbpassword,
+                host,
+                config.dbport.unwrap_or(DEFAULT_POSTGRES_PORT),
+                config.dbname
+            ),
+            None => format!(
+                "postgres://{}:{}@localhost/{}",
+                config.dbuser, config.dbpassword, config.dbname
+            ),
+        };
 
-    fn get_client(&self) -> Result<tokio_postgres::Client, Box<dyn Error + Send + Sync>> {
-        let host = self.config.dbip.as_deref().unwrap_or("localhost");
-        let port = self.config.dbport.unwrap_or(5432);
+        let manager = ConnectionManager::<PgConnection>::new(database_url);
+        let pool = Pool::builder()
+            .max_size(15)
+            .connection_timeout(Duration::from_secs(config.time as u64))
+            .build(manager)?;
 
-        let conn_str = format!(
-            "host={} port={} user={} password={} dbname={}",
-            host, port, self.config.dbuser, self.config.dbpassword, self.config.dbname
-        );
+        let table_name = config
+            .table_name
+            .clone()
+            .unwrap_or_else(|| DEFAULT_POSTGRES_TABLE.to_string());
 
-        let runtime = Arc::clone(&self.runtime);
-
-        runtime.block_on(async {
-            let (client, connection) =
-                tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await?;
-
-            // Important: This task must persist for the lifetime of the client.
-            // We don't need to keep the handle because the task will run
-            // as long as the runtime exists.
-            runtime.spawn(async move {
-                if let Err(e) = connection.await {
-                    eprintln!("PostgreSQL connection error: {}", e);
-                }
-            });
-
-            Ok(client)
+        Ok(Self {
+            config,
+            pool,
+            table_name,
         })
     }
+
+    fn get_connection(
+        &self,
+    ) -> Result<
+        diesel::r2d2::PooledConnection<ConnectionManager<PgConnection>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        Ok(self.pool.get()?)
+    }
 }
 
-impl Database for PostgresDatabase {
-    fn check_cert(
+#[async_trait]
+impl Database for DieselPgDatabase {
+    async fn check_cert(
         &self,
         certnum: &str,
         revoked: bool,
     ) -> Result<OcspCertStatus, Box<dyn Error + Send + Sync>> {
-        let client = self.get_client()?;
-        let runtime = Arc::clone(&self.runtime);
+        let table_name = self.table_name.clone();
+        let cert_num = certnum.to_string();
+        let connection_manager = self.pool.clone();
 
-        let rows = runtime.block_on(async {
-            client.query(
-                "SELECT status, revocation_time, revocation_reason FROM ocsp_list_certs WHERE cert_num = $1",
-                &[&certnum],
-            ).await
-        })?;
+        let result = tokio::task::spawn_blocking(move || -> Result<OcspCertStatus, Box<dyn Error + Send + Sync>> {
+            let mut conn = connection_manager.get()?;
 
-        if rows.is_empty() {
-            warn!("Entry not found for cert {} in PostgreSQL", certnum);
-            if !revoked {
-                Ok(OcspCertStatus::new(CertStatusCode::Unknown, None))
-            } else {
-                Ok(OcspCertStatus::new(
-                    CertStatusCode::Revoked,
-                    Some(RevokedInfo::new(
-                        GeneralizedTime::new(1970, 1, 1, 0, 0, 0).unwrap(),
-                        Some(CrlReason::OcspRevokeCertHold),
-                    )),
-                ))
-            }
-        } else {
-            let row = &rows[0];
-            let status: String = row.get(0);
-            debug!("Entry found for cert {}, status {}", certnum, status);
+            // Using text SQL query with explicit column names and types
+            let query = format!(
+                "SELECT cert_num, revocation_time, revocation_reason, status FROM {} WHERE cert_num = $1",
+                table_name
+            );
 
-            if status == "Revoked" {
-                let time = GeneralizedTime::now();
+            let results = diesel::sql_query(query)
+                .bind::<sql_types::Text, _>(&cert_num)
+                .load::<CertRecord>(&mut conn)?;
 
-                let revocation_time: Option<chrono::NaiveDateTime> = row.get(1);
-                let time = if let Some(rt) = revocation_time {
-                    let year = rt.year();
-                    let month = rt.month();
-                    let day = rt.day();
-                    let hour = rt.hour();
-                    let minute = rt.minute();
-                    let second = rt.second();
-
-                    GeneralizedTime::new(year, month, day, hour, minute, second).unwrap_or(time)
+            if results.is_empty() {
+                warn!("Entry not found for cert {} in PostgreSQL", cert_num);
+                if !revoked {
+                    Ok(OcspCertStatus::new(CertStatusCode::Unknown, None))
                 } else {
-                    time
-                };
-
-                let revocation_reason: Option<String> = row.get(2);
-                let motif = revocation_reason.unwrap_or_default();
-                let motif: CrlReason = match motif.as_str() {
-                    "key_compromise" => CrlReason::OcspRevokeKeyCompromise,
-                    "ca_compromise" => CrlReason::OcspRevokeCaCompromise,
-                    "affiliation_changed" => CrlReason::OcspRevokeAffChanged,
-                    "superseded" => CrlReason::OcspRevokeSuperseded,
-                    "cessation_of_operation" => CrlReason::OcspRevokeCessOperation,
-                    "certificate_hold" => CrlReason::OcspRevokeCertHold,
-                    "privilege_withdrawn" => CrlReason::OcspRevokePrivWithdrawn,
-                    "aa_compromise" => CrlReason::OcspRevokeAaCompromise,
-                    _ => CrlReason::OcspRevokeUnspecified,
-                };
-
-                Ok(OcspCertStatus::new(
-                    CertStatusCode::Revoked,
-                    Some(RevokedInfo::new(time, Some(motif))),
-                ))
+                    Ok(OcspCertStatus::new(
+                        CertStatusCode::Revoked,
+                        Some(RevokedInfo::new(
+                            GeneralizedTime::new(1970, 1, 1, 0, 0, 0).unwrap(),
+                            Some(CrlReason::OcspRevokeCertHold),
+                        )),
+                    ))
+                }
             } else {
-                Ok(OcspCertStatus::new(CertStatusCode::Good, None))
+                let record = &results[0];
+                debug!("Entry found for cert {}, status {}", cert_num, record.status);
+
+                if record.status == "Revoked" {
+                    let time = GeneralizedTime::now();
+
+                    let time = if let Some(rt) = record.revocation_time {
+                        GeneralizedTime::new(
+                            rt.year(),
+                            rt.month(),
+                            rt.day(),
+                            rt.hour(),
+                            rt.minute(),
+                            rt.second(),
+                        ).unwrap_or(time)
+                    } else {
+                        time
+                    };
+
+                    let motif = record.revocation_reason.clone().unwrap_or_default();
+                    let motif: CrlReason = match motif.as_str() {
+                        "key_compromise" => CrlReason::OcspRevokeKeyCompromise,
+                        "ca_compromise" => CrlReason::OcspRevokeCaCompromise,
+                        "affiliation_changed" => CrlReason::OcspRevokeAffChanged,
+                        "superseded" => CrlReason::OcspRevokeSuperseded,
+                        "cessation_of_operation" => CrlReason::OcspRevokeCessOperation,
+                        "certificate_hold" => CrlReason::OcspRevokeCertHold,
+                        "privilege_withdrawn" => CrlReason::OcspRevokePrivWithdrawn,
+                        "aa_compromise" => CrlReason::OcspRevokeAaCompromise,
+                        _ => CrlReason::OcspRevokeUnspecified,
+                    };
+
+                    Ok(OcspCertStatus::new(
+                        CertStatusCode::Revoked,
+                        Some(RevokedInfo::new(time, Some(motif))),
+                    ))
+                } else {
+                    Ok(OcspCertStatus::new(CertStatusCode::Good, None))
+                }
             }
-        }
+        }).await??;
+
+        Ok(result)
     }
 
     fn create_tables_if_needed(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -287,86 +363,154 @@ impl Database for PostgresDatabase {
             return Ok(());
         }
 
-        let client = self.get_client()?;
-        let runtime = Arc::clone(&self.runtime);
+        let mut conn = self.get_connection()?;
 
-        let exists = runtime.block_on(async {
-            let rows = client
-                .query(
-                    "SELECT EXISTS (
-                    SELECT FROM information_schema.tables
-                    WHERE table_schema = 'public' AND table_name = 'ocsp_list_certs'
-                )",
-                    &[],
-                )
-                .await?;
+        // Using a simpler check query that works well with QueryableByName
+        let exists_query = format!(
+            "SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_schema = 'public'
+                AND table_name = '{}'
+            ) as exists",
+            self.table_name
+        );
 
-            let exists: bool = rows[0].get(0);
-            Result::<_, tokio_postgres::Error>::Ok(exists)
-        })?;
+        let exists_results = diesel::sql_query(exists_query).load::<BoolResult>(&mut conn)?;
+
+        let exists = !exists_results.is_empty() && exists_results[0].exists;
 
         if exists {
-            info!("Table ocsp_list_certs already exists in PostgreSQL database");
+            info!(
+                "Table {} already exists in PostgreSQL database",
+                self.table_name
+            );
             return Ok(());
         }
 
-        let types_exist = runtime.block_on(async {
-            let rows = client
-                .query(
-                    "SELECT EXISTS (
-                    SELECT FROM pg_type
-                    WHERE typname = 'cert_status'
-                )",
-                    &[],
-                )
-                .await?;
+        // Check if types exist with a properly formatted query
+        let types_exist_query = "SELECT EXISTS (
+                SELECT FROM pg_type
+                WHERE typname = 'cert_status'
+            ) as exists";
 
-            let exists: bool = rows[0].get(0);
-            Result::<_, tokio_postgres::Error>::Ok(exists)
-        })?;
+        let types_exist_results =
+            diesel::sql_query(types_exist_query).load::<BoolResult>(&mut conn)?;
+
+        let types_exist = !types_exist_results.is_empty() && types_exist_results[0].exists;
 
         if !types_exist {
-            runtime.block_on(async {
-                client
-                    .batch_execute(
-                        "CREATE TYPE cert_status AS ENUM ('Valid', 'Revoked');
-                         CREATE TYPE revocation_reason_enum AS ENUM (
-                            'unspecified',
-                            'key_compromise',
-                            'ca_compromise',
-                            'affiliation_changed',
-                            'superseded',
-                            'cessation_of_operation',
-                            'certificate_hold',
-                            'privilege_withdrawn',
-                            'aa_compromise'
-                         );",
-                    )
-                    .await
-            })?;
+            // Split into two separate queries to avoid issues
+            diesel::sql_query("CREATE TYPE cert_status AS ENUM ('Valid', 'Revoked');")
+                .execute(&mut conn)?;
+
+            diesel::sql_query(
+                "CREATE TYPE revocation_reason_enum AS ENUM (
+                    'unspecified',
+                    'key_compromise',
+                    'ca_compromise',
+                    'affiliation_changed',
+                    'superseded',
+                    'cessation_of_operation',
+                    'certificate_hold',
+                    'privilege_withdrawn',
+                    'aa_compromise'
+                );",
+            )
+            .execute(&mut conn)?;
         }
 
-        runtime.block_on(async {
-            client
-                .batch_execute(
-                    "CREATE TABLE ocsp_list_certs (
-                    cert_num VARCHAR(50) PRIMARY KEY,
-                    revocation_time TIMESTAMP DEFAULT NULL,
-                    revocation_reason revocation_reason_enum DEFAULT NULL,
-                    status cert_status NOT NULL DEFAULT 'Valid'
-                );",
-                )
-                .await
-        })?;
+        diesel::sql_query(format!(
+            "CREATE TABLE {} (
+                cert_num VARCHAR(50) PRIMARY KEY,
+                revocation_time TIMESTAMP DEFAULT NULL,
+                revocation_reason revocation_reason_enum DEFAULT NULL,
+                status cert_status NOT NULL DEFAULT 'Valid'
+            );",
+            self.table_name
+        ))
+        .execute(&mut conn)?;
 
-        info!("Table ocsp_list_certs created successfully in PostgreSQL database");
+        info!(
+            "Table {} created successfully in PostgreSQL database",
+            self.table_name
+        );
         Ok(())
     }
 }
 
-pub fn create_database(config: Arc<Config>) -> Box<dyn Database> {
+pub fn create_database(
+    config: Arc<Config>,
+) -> Result<Box<dyn Database>, Box<dyn Error + Send + Sync>> {
     match DatabaseType::from_string(&config.db_type) {
-        DatabaseType::PostgreSQL => Box::new(PostgresDatabase::new(config)),
-        DatabaseType::MySQL => Box::new(MySqlDatabase::new(config)),
+        DatabaseType::MySQL => {
+            let db = DieselMysqlDatabase::new(config)?;
+            Ok(Box::new(db))
+        }
+        DatabaseType::PostgreSQL => {
+            let db = DieselPgDatabase::new(config)?;
+            Ok(Box::new(db))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockall::predicate::*;
+    use mockall::*;
+
+    mock! {
+        pub Database {}
+
+        #[async_trait]
+        impl Database for Database {
+            async fn check_cert(
+                &self,
+                certnum: &str,
+                revoked: bool,
+            ) -> Result<OcspCertStatus, Box<dyn Error + Send + Sync>>;
+
+            fn create_tables_if_needed(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
+        }
+    }
+
+    #[test]
+    fn test_database_type_from_string() {
+        assert!(matches!(
+            DatabaseType::from_string("mysql"),
+            DatabaseType::MySQL
+        ));
+        assert!(matches!(
+            DatabaseType::from_string("MySQL"),
+            DatabaseType::MySQL
+        ));
+        assert!(matches!(
+            DatabaseType::from_string("postgresql"),
+            DatabaseType::PostgreSQL
+        ));
+        assert!(matches!(
+            DatabaseType::from_string("postgres"),
+            DatabaseType::PostgreSQL
+        ));
+        assert!(matches!(
+            DatabaseType::from_string("PostgreSQL"),
+            DatabaseType::PostgreSQL
+        ));
+        assert!(matches!(
+            DatabaseType::from_string("unknown"),
+            DatabaseType::MySQL
+        ));
+    }
+
+    #[test]
+    fn test_default_table_names() {
+        assert_eq!(
+            DatabaseType::MySQL.default_table_name(),
+            DEFAULT_MYSQL_TABLE
+        );
+        assert_eq!(
+            DatabaseType::PostgreSQL.default_table_name(),
+            DEFAULT_POSTGRES_TABLE
+        );
     }
 }

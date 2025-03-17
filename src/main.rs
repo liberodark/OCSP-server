@@ -1,10 +1,10 @@
-#[macro_use]
 extern crate rocket;
 
 use chrono::{self, NaiveDateTime, Timelike};
 use chrono::{DateTime, Datelike, FixedOffset};
 use clap::Parser;
 use config_file::FromConfigFile;
+use log::{debug, error, info, trace, warn};
 use ocsp::common::asn1::Bytes;
 use ocsp::common::ocsp::{OcspExt, OcspExtI};
 use ocsp::request::OcspRequest;
@@ -26,6 +26,7 @@ use ring::{rand, signature};
 use rocket::http::ContentType;
 use rocket::State;
 use rocket::{data::ToByteUnit, Data};
+use rocket::{get, launch, post, routes};
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -39,11 +40,11 @@ use zeroize::Zeroize;
 mod database;
 mod r#struct;
 
-use database::{create_database, Database};
+use database::Database;
 
 fn signresponse(
     issuer_hash: &[u8],
-    private_key: &ring::rsa::KeyPair,
+    private_key: &ring::signature::RsaKeyPair,
     response: Vec<OneResp>,
     extensions: Option<Vec<OcspExtI>>,
     cert: Option<Vec<Bytes>>,
@@ -300,7 +301,7 @@ async fn upload(
                     trace!("Certificate is the issuer.");
                 }
 
-                match db.check_cert(&num, state.revocextended) {
+                match db.check_cert(&num, state.revocextended).await {
                     Ok(status) => status,
                     Err(err) => {
                         error!("Cannot query database: {}", err);
@@ -401,11 +402,11 @@ async fn upload(
     Ok((custom, response))
 }
 
-fn getprivatekey<T>(data: T) -> Result<ring::rsa::KeyPair, String>
+fn getprivatekey<T>(data: T) -> Result<ring::signature::RsaKeyPair, String>
 where
     T: AsRef<[u8]>,
 {
-    if let Ok(key_pair) = ring::rsa::KeyPair::from_pkcs8(data.as_ref()) {
+    if let Ok(key_pair) = ring::signature::RsaKeyPair::from_pkcs8(data.as_ref()) {
         return Ok(key_pair);
     }
 
@@ -413,7 +414,7 @@ where
 
     if pem_str.contains("-----BEGIN RSA PRIVATE KEY-----") {
         match convert_rsa_pem_to_pkcs8(&pem_str) {
-            Ok(pkcs8_der) => match ring::rsa::KeyPair::from_pkcs8(&pkcs8_der) {
+            Ok(pkcs8_der) => match ring::signature::RsaKeyPair::from_pkcs8(&pkcs8_der) {
                 Ok(key_pair) => return Ok(key_pair),
                 Err(e) => {
                     return Err(format!(
@@ -426,7 +427,7 @@ where
         }
     } else if pem_str.contains("-----BEGIN PRIVATE KEY-----") {
         match pem::parse(pem_str.as_bytes()) {
-            Ok(pem) => match ring::rsa::KeyPair::from_pkcs8(pem.contents()) {
+            Ok(pem) => match ring::signature::RsaKeyPair::from_pkcs8(pem.contents()) {
                 Ok(key_pair) => return Ok(key_pair),
                 Err(e) => return Err(format!("Error creating KeyPair from PEM PKCS#8: {}", e)),
             },
@@ -459,7 +460,7 @@ fn pem_to_der(pem_str: &str) -> Vec<u8> {
 }
 
 #[launch]
-fn rocket() -> _ {
+fn rocket() -> rocket::Rocket<rocket::Build> {
     let cli = Cli::parse();
 
     let config_path = &cli.config_path;
@@ -559,13 +560,21 @@ fn rocket() -> _ {
         db_type,
         dbport,
         create_table: config.create_table.unwrap_or(false),
+        table_name: config.table_name.clone(),
     });
 
     // Create database connection and tables if needed
-    let db = create_database(config.clone());
-    if let Err(e) = db.create_tables_if_needed() {
-        eprintln!("Error creating tables: {}", e);
-    }
+    let db = match database::create_database(config.clone()) {
+        Ok(db) => {
+            if let Err(e) = db.create_tables_if_needed() {
+                eprintln!("Error creating tables: {}", e);
+            }
+            db
+        }
+        Err(e) => {
+            panic!("Failed to initialize database: {}", e);
+        }
+    };
 
     // Create cache folder if it doesn't exist
     let path = Path::new(config.cachefolder.as_str());
