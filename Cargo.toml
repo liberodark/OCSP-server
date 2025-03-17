@@ -2,10 +2,9 @@
 name = "ocsp-server"
 authors = ["DorianCoding <108593662+DorianCoding@users.noreply.github.com>"]
 description = "OCSP server, listening for requests to give responses."
-version = "0.4.1"
-edition = "2024"
+version = "0.4.2"
+edition = "2021"
 license = "GPL-3.0-only"
-rust-version = "1.85"
 repository = "https://github.com/DorianCoding/OCSP_server"
 keywords = ["ocsp", "server", "ocsp-response"]
 categories = ["caching", "cryptography"]
@@ -21,6 +20,10 @@ chrono = { version = "~0.4.40", default-features = false, features = ["std"]}
 config-file = "~0.2.3"
 hex = "~0.4.3"
 mysql = { version = "~26.0.0", default-features = false, features = ["minimal"]}
+tokio-postgres = { version = "0.7.10", features = ["with-chrono-0_4"] }
+tokio = { version = "1.36.0", features = ["full", "rt-multi-thread"] }
+futures = "0.3.31"
+postgres-types = { version = "0.2.6", features = ["derive"] }
 ocsp = {git = "https://github.com/DorianCoding/ocsp-rs.git", tag="1.0.0" }
 #ocsp = {git = "https://github.com/maicallist/ocsp-rs.git" }
 pem = "3.0.5"

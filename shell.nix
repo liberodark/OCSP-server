@@ -7,6 +7,8 @@ pkgs.mkShell {
     cargo-audit
     rustfmt
     rust-analyzer
+    git
+    openssl
   ];
 
   shellHook = ''
