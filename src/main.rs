@@ -17,6 +17,8 @@ use ocsp::{
         ResponderId, ResponseBytes, ResponseData,
     },
 };
+use openssl::pkey::PKey;
+use openssl::rsa::Rsa;
 use pem::parse;
 use r#struct::*;
 use ring::digest::SHA1_FOR_LEGACY_USE_ONLY;
@@ -385,9 +387,9 @@ async fn upload(
     let response = response.unwrap();
     if possible {
         let date = chrono::Local::now();
-        let date = date.checked_add_days(chrono::Days::new(state.cachedays.into())); //TODO: Implement
-        if date.is_some() {
-            match addtocache(state, &certnum, date.unwrap().fixed_offset(), &response) {
+        let date = date.checked_add_days(chrono::Days::new(u64::from(state.cachedays)));
+        if let Some(date) = date {
+            match addtocache(state, &certnum, date.fixed_offset(), &response) {
                 Ok(_) => (),
                 Err(_) => {
                     warn!("Cannot write to cache");
@@ -399,11 +401,51 @@ async fn upload(
     Ok((custom, response))
 }
 
-fn getprivatekey<T>(data: T) -> Result<ring::rsa::KeyPair, ring::error::KeyRejected>
+fn getprivatekey<T>(data: T) -> Result<ring::rsa::KeyPair, String>
 where
     T: AsRef<[u8]>,
 {
-    ring::rsa::KeyPair::from_pkcs8(data.as_ref())
+    if let Ok(key_pair) = ring::rsa::KeyPair::from_pkcs8(data.as_ref()) {
+        return Ok(key_pair);
+    }
+
+    let pem_str = String::from_utf8_lossy(data.as_ref());
+
+    if pem_str.contains("-----BEGIN RSA PRIVATE KEY-----") {
+        match convert_rsa_pem_to_pkcs8(&pem_str) {
+            Ok(pkcs8_der) => match ring::rsa::KeyPair::from_pkcs8(&pkcs8_der) {
+                Ok(key_pair) => return Ok(key_pair),
+                Err(e) => {
+                    return Err(format!(
+                        "Error creating KeyPair from converted PKCS#8: {}",
+                        e
+                    ))
+                }
+            },
+            Err(e) => return Err(format!("RSA PEM conversion error: {}", e)),
+        }
+    } else if pem_str.contains("-----BEGIN PRIVATE KEY-----") {
+        match pem::parse(pem_str.as_bytes()) {
+            Ok(pem) => match ring::rsa::KeyPair::from_pkcs8(pem.contents()) {
+                Ok(key_pair) => return Ok(key_pair),
+                Err(e) => return Err(format!("Error creating KeyPair from PEM PKCS#8: {}", e)),
+            },
+            Err(e) => return Err(format!("PEM parsing error: {}", e)),
+        }
+    } else if pem_str.contains("-----BEGIN EC PRIVATE KEY-----") {
+        return Err("EC key format is not supported".to_string());
+    }
+
+    Err("Unsupported key format".to_string())
+}
+
+fn convert_rsa_pem_to_pkcs8(
+    pem_str: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let pem = pem::parse(pem_str.as_bytes())?;
+    let rsa = Rsa::private_key_from_der(pem.contents())?;
+    let pkey = PKey::from_rsa(rsa)?;
+    Ok(pkey.private_key_to_pkcs8()?)
 }
 
 fn pem_to_der(pem_str: &str) -> Vec<u8> {
@@ -469,8 +511,18 @@ fn rocket() -> _ {
     let sha1key = ring::digest::digest(&SHA1_FOR_LEGACY_USE_ONLY, certpempublickey);
 
     // Read private key and zero it after use
-    let mut key = fs::read(&config.itkey).unwrap();
-    let rsakey = getprivatekey(&key).unwrap();
+    let mut key = fs::read(&config.itkey).unwrap_or_else(|e| {
+        panic!("Error reading key file: {}", e);
+    });
+
+    let rsakey = match getprivatekey(&key) {
+        Ok(key_pair) => key_pair,
+        Err(e) => {
+            eprintln!("Error loading private key: {}", e);
+            eprintln!("Supported formats: PKCS#8, PEM PKCS#1 (RSA)");
+            panic!("Key loading failed");
+        }
+    };
     key.zeroize();
 
     // Get HTTP port
