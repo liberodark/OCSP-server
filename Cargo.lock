@@ -459,10 +459,12 @@ dependencies = [
  "chrono",
  "diesel_derives",
  "itoa",
+ "libsqlite3-sys",
  "mysqlclient-sys",
  "percent-encoding",
  "pq-sys",
  "r2d2",
+ "time",
  "url",
 ]
 
@@ -1066,6 +1068,16 @@ name = "libc"
 version = "0.2.171"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c19937216e9d3aa9956d9bb8dfc0b0c8beb6058fc4f7a4dc4d850edf86a237d6"
+
+[[package]]
+name = "libsqlite3-sys"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8935b44e7c13394a179a438e0cebba0fe08fe01b54f152e29a93b5cf993fd4"
+dependencies = [
+ "pkg-config",
+ "vcpkg",
+]
 
 [[package]]
 name = "linux-raw-sys"
