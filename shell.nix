@@ -17,8 +17,9 @@ pkgs.mkShell {
   ];
 
   shellHook = ''
-    rustfmt --edition 2024 src/*.rs
+    rustfmt --edition 2021 src/*.rs
     cargo audit
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true
   '';
 
   RUST_BACKTRACE = 1;
